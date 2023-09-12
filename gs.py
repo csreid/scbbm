@@ -1,91 +1,170 @@
 import sys
 sys.path.append('/home/csreid/.pyenv/versions/3.10.12/lib/python3.10/site-packages')
 from pbp_dataset import PlayByPlayDataset
+from score_dataset import ScoreDataset
 import torch
 import pandas as pd
-from torch.nn import GRU, CrossEntropyLoss, Module, KLDivLoss, LSTM, Linear, functional as F, RNN, MSELoss, BCEWithLogitsLoss
+from torch.nn import GRU, CrossEntropyLoss, Module, KLDivLoss, LSTM, Linear, Embedding, functional as F, RNN, MSELoss, BCEWithLogitsLoss, L1Loss
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 from torch.optim import Adam, SGD, RMSprop
 import matplotlib.pyplot as plt
 from IPython.display import clear_output
 from IPython import embed
+import matplotlib.pyplot as plt
 
 import numpy as np
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
-writer = SummaryWriter()
-
 def data_collate(samples):
 	teams = [s[0] for s in samples]
 	plays = [s[1] for s in samples]
-	targets = [s[2] for s in samples]
+	play_targets = [s[2] for s in samples]
+	times = [s[3] for s in samples]
+	time_targets = [s[4] for s in samples]
 
 	teams_tens = torch.stack(teams)
 
+	times_tens = pad_sequence(times)
+	time_targets_tens = pad_sequence(time_targets)
+
 	plays_tens = pad_sequence(plays)
-	plays_tens = pack_padded_sequence(plays_tens, [len(p) for p in plays], enforce_sorted=False)
 
-	targets_tens = pad_sequence(targets)
+	targets_tens = pad_sequence(play_targets)
 
-	#targets_tens = torch.stack(targets_tens)
-	targets_tens = pack_padded_sequence(targets_tens, [len(p) for p in targets], enforce_sorted=False)
+	return teams_tens.long(), plays_tens.long(), targets_tens, times_tens.unsqueeze(2), time_targets_tens.unsqueeze(2)
 
-	return teams_tens.unsqueeze(0), plays_tens, targets_tens#targets_tens.squeeze()
+def collate_scores(samples):
+	teams = [s[0] for s in samples]
+	scores_and_times = [s[1] for s in samples]
 
+	scores_and_times = pad_sequence(scores_and_times)
+
+	teams = torch.stack(teams)
+
+	return teams, scores_and_times
 
 class GameSimulator(Module):
 	def __init__(self, n_teams, n_plays):
 		super().__init__()
 		self._n_plays = n_plays
+		self._n_teams = n_teams
 
-		self.team_input = Linear(n_teams, 1000)
-		self.play_input = Linear(n_plays, 1000)
-		self.recurrent = GRU(1000, 1000)
-		self.output = Linear(1000, n_plays)
+		self.team_input = Embedding(n_teams, 10, max_norm=1.)
+		self.play_input = Embedding(n_plays, 50, max_norm=1., padding_idx=0)
 
-	def forward(self, teams, plays):
-		team_out = F.tanh(self.team_input(teams))
-		team_out, h = self.recurrent(team_out)
+		self.recurrent_score = LSTM(20, 200, num_layers=1)
+		self.score_out = Linear(200, 2)
+		self.score_time_out = Linear(200, 1)
+		#torch.nn.init.zeros_(self.score_out.weight)
 
-		play_out = F.tanh(self.play_input(plays))
-		out, _ = self.recurrent(play_out, h)
-		#out = out[-1, :, :]
-		out = self.output(out)
-		#out = out.transpose(0, 1)
+		self.recurrent1 = LSTM(71, 150, num_layers=2)
+		self.recurrent2 = LSTM(150, 150, num_layers=1)
+		self.play_out = Linear(150, n_plays)
+		self.time_output = Linear(150, 1)
 
-		out_shape = out.shape
+		self.team_filter = Linear(n_teams, n_plays)
+		torch.nn.init.zeros_(self.team_filter.weight)
 
-		return out
+	def forward(self, teams, plays, times):
+		batch_n = plays.shape[1]
+		seq_n = plays.shape[0]
+
+		play_emb = self.play_input(plays)
+		flat_teams = torch.flatten(self.team_input(teams), start_dim=1, end_dim=2)
+
+		teams_emb = (flat_teams).unsqueeze(0).expand(seq_n, -1, -1)
+
+		out = torch.cat((teams_emb, play_emb, times), dim=2)
+		out, _ = self.recurrent1(out)
+
+		out1 = self.play_out(out)
+
+		out2, _ = self.recurrent2(out)
+		out2  = self.time_output(out2)
+
+		#cumulative_time = torch.cumsum(out2, dim=0)
+		#initial_time = times[0, :, 0].reshape(1, -1, 1).expand(cumulative_time.shape)
+
+		#out2 = cumulative_time + initial_time
+		dev = next(self.parameters()).device
+		team_filter_input = torch.zeros(len(teams), self._n_teams)
+		for (h_idx, a_idx), row in zip(teams, team_filter_input):
+			row[h_idx] = 1.
+			row[a_idx] = 1.
+
+		team_filter_input = team_filter_input.expand(1, len(teams), self._n_teams).to(dev)
+		filter_result = self.team_filter(team_filter_input)
+
+		out1 = out1 * filter_result
+
+		return out1, out2
+
+	def scores(self, teams, length=200):
+		teams = self.team_input(teams)
+		teams = torch.flatten(teams, start_dim=1, end_dim=2)
+
+		batch_size, team_feats = teams.shape
+
+		teams = teams.unsqueeze(0).expand(length, batch_size, team_feats)
+
+		out, _ = self.recurrent_score(teams)
+		out = F.sigmoid(out)
+
+		score_out = self.score_out(out)
+		time_out = F.hardsigmoid(self.score_time_out(out)) * 3600.
+
+		return score_out, time_out
+
+	def sim_scores(self, home, away, ds, length):
+		teams_tens = ds._teams_to_tensor(home, away)
+
+		scores, times = self.scores(teams_tens.unsqueeze(0), length)
+
+		return scores, times
 
 	def simulate(self, home, away, dataset, maxlen=10):
-		plays = [f'Home: {home}', f'Away: {away}']
+		plays = ['Jump Ball won by Purdue']
+		times = [0]
 		teams_tens = dataset._teams_to_tensor(home, away)
 
-		for _ in range(maxlen):
-			subgame = pd.DataFrame({"description": plays})
-			plays_tens = dataset._subgame_to_tensor(subgame)
+		if maxlen:
+			condition = lambda idx: idx == maxlen
+		else:
+			condition = lambda idx: (plays[-1] == 'End of Game') or (idx == 300)
+
+		idx = 0
+		while not condition(idx):
+			subgame = pd.DataFrame({"description": plays, "time_elapsed": times})
+			plays_tens, times_tens = dataset._subgame_to_tensor(subgame)
+
 			with torch.no_grad():
-				next_play_dist = F.softmax(self.forward(teams_tens.unsqueeze(0).unsqueeze(0), plays_tens.unsqueeze(1))[-1, :].squeeze()).numpy()
-	
-			next_play_idx = np.random.choice(self._n_plays, p=next_play_dist)
+				play_out, time_out = self.forward(teams_tens.unsqueeze(0), plays_tens.unsqueeze(1), times_tens.reshape((-1, 1, 1)))
+				play_out = play_out[-1, 0, :]
+				next_play_dist = F.softmax(play_out[1:], dim=0).numpy()
+				next_time = time_out[-1]
+
+			next_play_idx = np.random.choice(self._n_plays-1, p=next_play_dist) + 1
 			next_play = dataset.plays[next_play_idx]
 
+			times.append(next_time)
 			plays.append(next_play)
+			idx += 1
 
-		return plays
+		return plays, times
 
 
-if __name__ == '__main__':
+def main_sim():
 	try:
-		pbp = PlayByPlayDataset('cleaned_data.csv', min_len=3, max_len=5)
-		gs = GameSimulator(len(pbp.teams), len(pbp.plays)).to('cuda:0')
+		pbp = PlayByPlayDataset('cleaned_data.csv', min_len=2, max_len=20, size=1000000)
+		gs = GameSimulator(len(pbp.teams), len(pbp.plays))
 		try:
-			gs.load_state_dict(torch.load('model.ptch'))
-			print(f'Successfully loaded model')
+			#gs.load_state_dict(torch.load('model.ptch'))
+			gs = gs.to('cuda:0')
+			tqdm.write(f'Successfully loaded model')
 		except:
-			print('Could not resume model training')
+			tqdm.write('Could not resume model training')
 
 		finally:
 			gs.to('cuda:0')
@@ -93,42 +172,117 @@ if __name__ == '__main__':
 		batch_size=32
 		loader = DataLoader(pbp, batch_size=batch_size, collate_fn=data_collate, shuffle=True)
 
-		play_loss_fn = CrossEntropyLoss(reduction='mean')
+		play_loss_fn = CrossEntropyLoss(reduction='mean', ignore_index=0)
+		time_loss_fn = L1Loss()
 		opt = Adam(gs.parameters())
 
-		losses = []
-		epoch_prog = tqdm(range(10), position=0)
-		print(f'Length of dataset: {len(pbp)}')
+		filter_opt = SGD(gs.team_filter.parameters(), lr=0.2)
+
+		epoch_prog = tqdm(range(100), position=0)
+		tqdm.write(f'Length of dataset: {len(pbp)}')
+		counter = 0
+		writer = SummaryWriter()
 		for epoch in epoch_prog:
-			if len(losses) != 0:
-				epoch_prog.set_postfix({'Previous epoch loss': np.mean(losses)})
-			losses = []
-			prog = tqdm(enumerate(loader), total=len(pbp) / batch_size, position=1, leave=False)
-			for idx, (team_X, play_X, Y) in prog:
+			prog = tqdm(enumerate(loader), total=int(len(pbp) / batch_size), position=1, leave=False)
+
+			for idx, (team_X, play_X, play_Y, time_X, time_Y) in prog:
 				team_X = team_X.to('cuda:0')
 				play_X = play_X.to('cuda:0')
-				play_X = pad_packed_sequence(play_X)[0].float()
-	
-				Y = pad_packed_sequence(Y)[0].float()
-				Y = Y.transpose(0, 1).transpose(1,2)
-				Y = Y.to('cuda:0')
 
-				Y_pred = gs(team_X, play_X).to('cuda:0').transpose(0,2).transpose(0,1)
-				loss = play_loss_fn(Y_pred, Y)
-				losses.append(loss.item())
-				writer.add_scalar('Loss/train', loss, epoch * (len(pbp)/batch_size) + idx)
+				Y = play_Y.to('cuda:0').transpose(0,1)
 
+				time_Y = time_Y.to('cuda:0')
+				time_X = time_X.to('cuda:0')
+
+				Y_pred_play, Y_pred_time = gs(team_X, play_X, time_X)
+
+				Y_pred_play = Y_pred_play.to('cuda:0').transpose(0,2).transpose(0,1)
+				Y_pred_time = Y_pred_time.to('cuda:0')
+
+				play_loss = play_loss_fn(Y_pred_play, Y)
+				time_loss = time_loss_fn(Y_pred_time, time_Y)
+				loss = play_loss + time_loss
+
+				writer.add_scalar('Loss/play', play_loss, counter)
+				writer.add_scalar('Loss/time', time_loss, counter)
+				writer.add_scalar('Loss/total', loss, counter)
+
+				filter_opt.zero_grad()
 				opt.zero_grad()
 				loss.backward()
 				opt.step()
-				#epoch_prog.set_description(f'Step {idx}/{len(loader)}')
-				if (idx % 1000) == 0:
-					gs = gs.to('cpu')
-					sample = "\n".join(gs.simulate("Purdue", "UConn", pbp))
-					writer.add_text('sample', sample, idx)
-					gs = gs.to('cuda:0')
+				filter_opt.step()
+
+				counter += 1
 
 			torch.save(gs.state_dict(), 'model.ptch')
+			# Do a test run
+			gs = gs.to('cpu')
+			plays, times = gs.simulate('Purdue', 'Rutgers', pbp, maxlen=None)
+			sample = "  \n".join([f'{p} @ {t} seconds' for p, t in zip(plays, times)])
+			writer.add_text(f'Sample', sample, epoch * (len(pbp) / batch_size))
+			gs = gs.to('cuda:0')
+
 	except:
 		raise
 		#embed()
+
+def main_score():
+	writer = SummaryWriter()
+	sd = ScoreDataset('cleaned_data.csv')
+	gs = GameSimulator(len(sd.teams), 69).to('cuda:0')
+
+	batch_size=64
+
+	loader = DataLoader(sd, batch_size=batch_size, collate_fn=collate_scores, shuffle=True)
+
+	loss_fn = MSELoss()
+	opt = Adam(gs.parameters())
+
+	epoch_prog = tqdm(range(500), position=0)
+	ctr = 0
+	try:
+		gs.load_state_dict(torch.load('model.ptch'))
+		tqdm.write(f'Loaded model')
+	except:
+		tqdm.write(f'Failed to load model')
+	for epoch in epoch_prog:
+		prog = tqdm(loader, total=int(len(sd) / batch_size), position=1, leave=False)
+		for X, Y in prog:
+			X = X.to('cuda:0')
+			Y = Y.to('cuda:0')
+			Y_pred_scores, Y_pred_times = gs.scores(X, length=Y.shape[0])
+			Y_pred_scores = Y_pred_scores.to('cuda:0')
+			Y_pred_times = Y_pred_times.to('cuda:0')
+
+			loss_scores = loss_fn(Y_pred_scores, Y[:, :, :2])
+			loss_time = loss_fn(Y_pred_times, Y[:, :, 2:])
+
+			loss = loss_scores + loss_time
+
+			opt.zero_grad()
+			loss.backward()
+			opt.step()
+
+			writer.add_scalar('Loss/score', loss_scores, ctr)
+			writer.add_scalar('Loss/time', loss_time, ctr)
+			ctr += 1
+
+			if (ctr % 100) == 0:
+				gs.to('cpu')
+				scores, times = gs.sim_scores('Purdue', 'UConn', sd, 300)
+				home_score = scores[:, 0, 0].detach().numpy()
+				away_score = scores[:, 0, 1].detach().numpy()
+				times = times[:, 0].detach().numpy()
+
+				fig = plt.figure()
+				plt.plot(times, home_score, label='Purdue')
+				plt.plot(times, away_score, label='UConn')
+				plt.legend()
+
+				writer.add_figure('Purdue v. UConn', fig, ctr)
+				gs.to('cuda:0')
+		torch.save(gs.state_dict(), 'model.ptch')
+
+if __name__ == '__main__':
+	main_score()
