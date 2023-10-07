@@ -3,18 +3,25 @@ sys.path.append('/home/csreid/.pyenv/versions/3.10.12/lib/python3.10/site-packag
 import torch
 from score_dataset import ScoreDataset
 from gs import GameSimulator
+import matplotlib.pyplot as plt
 
 sd = ScoreDataset('cleaned_data.csv')
 gs = GameSimulator(len(sd.teams), 69)
-gs.load_state_dict(torch.load('model.ptch'))
+try:
+	gs.load_state_dict(torch.load('model.ptch'))
+except:
+	print(f'Failed to load model')
 
-scores, times = gs.sim_scores('Purdue', 'Hartford', sd, length=300)
+home = 'Purdue'
+away = 'Louisville'
+
+scores, times = gs.sim_scores(home, away, sd, length=300)
 
 scores = scores[:, 0]
 times = times[:, 0]
 
-for (score, time) in zip(scores, times):
-	print(f'{int(score[0])} | {int(score[1])} @ {int(time)}')
+plt.plot(times.detach().numpy(), scores[:, 0].detach().numpy(), label=home)
+plt.plot(times.detach().numpy(), scores[:, 1].detach().numpy(), label=away)
+plt.legend()
 
-	if time > 2000:
-		break
+plt.show()

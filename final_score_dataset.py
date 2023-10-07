@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 import sys
 sys.path.append('/home/csreid/.pyenv/versions/3.10.12/lib/python3.10/site-packages')
 
-class ScoreDataset(Dataset):
+class FinalScoreDataset(Dataset):
 	def __init__(self, df_path):
 		self.df = pd.read_csv('cleaned_data.csv')
 		homes = self.df['home'].unique()
@@ -49,26 +49,12 @@ class ScoreDataset(Dataset):
 		away = subgame.iloc[0].away
 
 		X = self._teams_to_tensor(home, away)
-		Y_home = torch.tensor(list(subgame.home_score))
-		Y_away = torch.tensor(list(subgame.away_score))
-		Y_time = torch.tensor(list(subgame.time_elapsed))
+		Y = torch.tensor([subgame.iloc[-1].home_score, subgame.iloc[-1].away_score])
 
-		Y = torch.stack([Y_home, Y_away, Y_time], dim=0)
-		Y = Y.transpose(0, 1)
-
-		return X, Y
+		return X, Y.float()
 
 	def __getitem__(self, idx):
 		game_id = self.game_id_map[idx]
+		subgame = self.df[self.df.game_id == game_id]
 
-		X, Y = self._X_Y(self.df[self.df.game_id == game_id])
-
-		return X, Y
-
-if __name__ == '__main__':
-	from torch.utils.data import DataLoader
-
-	sd = ScoreDataset('cleaned_data.csv')
-	loader = DataLoader(sd)
-
-	print(next(iter(loader)))
+		return self._X_Y(subgame)
