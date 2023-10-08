@@ -333,8 +333,11 @@ def main_finalscore(gs):
 if __name__ == '__main__':
 	pbp = PlayByPlayDataset('cleaned_data.csv', min_len=2, max_len=5, size=1000000)
 	model = GameSimulator(len(pbp.teams), len(pbp.plays)).to('cuda:0')
-	model.load_state_dict(torch.load('model.ptch'))
+	try:
+		model.load_state_dict(torch.load('model.ptch'))
+	except:
+		tqdm.write(f'Couldn\'t load model')
 
-	#model = main_finalscore(model)
+	model = main_finalscore(model)
 	model = main_sim(model)
 	torch.save(model.state_dict(), 'model.ptch')
