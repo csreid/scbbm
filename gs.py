@@ -335,8 +335,8 @@ if __name__ == '__main__':
 	model = GameSimulator(len(pbp.teams), len(pbp.plays)).to('cuda:0')
 	try:
 		model.load_state_dict(torch.load('model.ptch'))
-	except:
-		tqdm.write(f'Couldn\'t load model')
+	except Exception as e:
+		tqdm.write(f'Couldn\'t load model: {e}')
 
 	model = main_finalscore(model)
 	model = main_sim(model)
