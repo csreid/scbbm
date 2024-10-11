@@ -9,14 +9,15 @@ from tqdm import tqdm
 @click.option('--output-file', default=None, help='Path to save the output weights')
 @click.option('--load-from', default=None, help='Checkpoint from which to resume training')
 @click.option('--save-after-epoch/--no-save-after-epoch', default=True, help='Checkpoint after every epoch or only at the end?')
-def main(epochs, batch_size, data, outputfile, load_from):
+def main(epochs, batch_size, dataset_size, data, output_file, load_from, save_after_epoch):
 	import torch
 	from models.game_sim import GameSimulator
 	from trainers.sim_trainer import do_epoch
 	from pbp_dataset import PlayByPlayDataset
 	from torch.optim import Adam, SGD
+	from torch.utils.tensorboard import SummaryWriter
 
-	pbp = PlayByPlayDataset(load_from, min_len=2, max_len=20, size=100000)
+	pbp = PlayByPlayDataset(load_from, min_len=2, max_len=20, size=dataset_size)
 	model = GameSimulator(len(pbp.teams), len(pbp.plays)).to('cuda:0')
 	writer = SummaryWriter()
 	opt = Adam(model.parameters())
@@ -33,11 +34,15 @@ def main(epochs, batch_size, data, outputfile, load_from):
 	for epoch in epoch_prog:
 		model, losses, steps = do_epoch(
 			model,
-			dataset,
+			pbp,
 			batch_size,
 			opt,
-			save_to=save_to,
-			writer
+			save_to=output_file,
+			writer=writer,
+			start_step=all_steps
 		)
 
 		all_steps += steps
+
+if __name__ == '__main__':
+	main()

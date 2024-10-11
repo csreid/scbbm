@@ -1,5 +1,33 @@
 import torch
-from torch.nn import CrossEntropyLoss, Module, LSTM, Linear, Embedding, functional as F, RNN, MSELoss, BCEWithLogitsLoss
+from tqdm import tqdm
+from torch.nn import (
+	CrossEntropyLoss,
+	Module,
+	LSTM,
+	Linear,
+	Embedding,
+	functional as F,
+	RNN,
+	MSELoss,
+	BCEWithLogitsLoss,
+	GRU,
+)
+
+class PlayNetwork(Module):
+	def __init__(self, in_feats, n_plays):
+		super().__init__()
+		self.fc1 = Linear(in_feats, 2000)
+		self.fc2 = Linear(in_feats, 1000)
+		self.out = Linear(1000, n_plays)
+
+	def forward(self, X):
+		out = self.fc1(X)
+		out = F.leaky_relu(out, negative_slope=0.1)
+		out = self.fc2(X)
+		out = F.leaky_relu(out, negative_slope=0.1)
+		out = self.out(out)
+
+		return out
 
 class GameSimulator(Module):
 	def __init__(self, n_teams, n_plays):
@@ -8,84 +36,49 @@ class GameSimulator(Module):
 		self._n_teams = n_teams
 
 		team_feats = 10
-		play_feats = 200
+		play_feats = 1000
+		rec_feats = 1000
+		layers = 1
 
 		self.team_input = Embedding(n_teams, team_feats, max_norm=1.)
-		self.play_input = Embedding(n_plays, play_feats, max_norm=1., padding_idx=0)
+		self.play_input = Embedding(n_plays, play_feats, max_norm=1., padding_idx=0, scale_grad_by_freq=True)
 
-		self.recurrent_score = LSTM(team_feats, 500, num_layers=1)
-		self.score_out = Linear(500, 2)
-		self.score_time_out = Linear(500, 1)
+		self.recurrent = LSTM(2 * team_feats + play_feats, rec_feats, num_layers=layers)
+		self.play_out = PlayNetwork(rec_feats + n_teams, n_plays)
+		self.device = 'cpu'
+		#self.time_output = Linear(rec_feats, 1)
 
-		self.final_score_out = Linear(team_feats, 2)
+	def to(self, device):
+		res = super().to(device)
+		self.play_input = self.play_input.to('cpu')
+		self.team_input = self.team_input.to('cpu')
 
-		self.recurrent1 = LSTM(2 * team_feats + play_feats + 1, 500, num_layers=2)
-		self.recurrent2 = LSTM(500, 500, num_layers=1)
-		self.play_fc = Linear(500, 500)
-		self.play_out = Linear(500, n_plays)
-		self.time_output = Linear(500, 1)
+		return res
 
-		self.team_filter = Linear(n_teams, n_plays)
-		torch.nn.init.zeros_(self.team_filter.weight)
-
-	def forward(self, teams, plays, times):
+	def forward(self, teams, plays, times, state=None):
 		batch_n = plays.shape[1]
 		seq_n = plays.shape[0]
 
 		play_emb = self.play_input(plays)
+		play_emb = play_emb.to('cuda:0')
+		teams_emb = self.team_input(teams)
+		teams_emb = teams_emb.to('cuda:0')
 
-		with torch.no_grad():
-			flat_teams = torch.flatten(self.team_input(teams), start_dim=1, end_dim=2)
+		flat_teams = torch.flatten(teams_emb, start_dim=2, end_dim=3)
 
-		teams_emb = (flat_teams).unsqueeze(0).expand(seq_n, -1, -1)
+		out = torch.cat((flat_teams, play_emb), dim=2)
+		out, state = self.recurrent(out, state)
 
-		out = torch.cat((teams_emb, play_emb, times), dim=2)
-		out, _ = self.recurrent1(out)
+		teams_vec = torch.zeros(1, batch_n, self._n_teams)
+		for t in teams:
+			teams_vec[0, :, t] = 1.
+		teams_vec = teams_vec.expand(seq_n, -1, -1).to(self.device)
 
-		out1 = self.play_fc(out)
-		out1 = self.play_out(out)
+		#play_out = self.play_out(out)
+		out = torch.cat((teams_vec.to('cuda:0', non_blocking=True), out), dim=2)
+		play_out = self.play_out(out)
 
-		out2, _ = self.recurrent2(out)
-		out2  = self.time_output(out2)
-
-		dev = next(self.parameters()).device
-		team_filter_input = torch.zeros(len(teams), self._n_teams)
-		for (h_idx, a_idx), row in zip(teams, team_filter_input):
-			row[h_idx] = 1.
-			row[a_idx] = 1.
-
-		team_filter_input = team_filter_input.expand(1, len(teams), self._n_teams).to(dev)
-		filter_result = self.team_filter(team_filter_input)
-
-		out1 = out1 * filter_result
-
-		return out1, out2
-
-	def scores(self, teams, length=200):
-		with torch.no_grad():
-			teams = self.team_input(teams)
-		teams = torch.diff(teams, dim=1)
-		teams = teams.squeeze(1)
-
-		batch_size, team_feats = teams.shape
-
-		teams = teams.expand(length, batch_size, team_feats)
-
-		out, _ = self.recurrent_score(teams)
-		out = F.sigmoid(out)
-
-		score_out = F.sigmoid(self.score_out(out)) * 200
-		time_out = F.sigmoid(self.score_time_out(out)) * 3600.
-
-		return score_out, time_out
-
-	def final_score(self, teams):
-		out = self.team_input(teams)
-		out = torch.diff(out, dim=1)
-		out = out.squeeze(1)
-		out = self.final_score_out(out)
-
-		return out
+		return play_out, state
 
 if __name__ == '__main__':
 	gs = GameSimulator(1, 1)
