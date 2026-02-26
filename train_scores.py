@@ -7,11 +7,12 @@ import pandas as pd
 
 from models.score_predictor import ScorePredictor
 
-data = pd.read_csv('ncaahoopR_data/2023-24/pbp_logs/schedule.csv')
+data = pd.read_csv("ncaahoopR_data/2023-24/pbp_logs/schedule.csv")
 teams = set()
-teams |= set(list(data['home'].values))
-teams |= set(list(data['away'].values))
+teams |= set(list(data["home"].values))
+teams |= set(list(data["away"].values))
 teams = sorted(list(teams))
+
 
 class ScoreDataset(Dataset):
 	def __init__(self, data):
@@ -27,6 +28,7 @@ class ScoreDataset(Dataset):
 
 	def __len__(self):
 		return len(self._data)
+
 
 ds = ScoreDataset(data)
 loader = DataLoader(ds, batch_size=64)
@@ -46,6 +48,6 @@ for epoch in tqdm(range(200)):
 		loss.backward()
 		opt.step()
 
-		tqdm.write(f'{loss.item()}')
+		tqdm.write(f"{loss.item()}")
 
-torch.save(model.state_dict(), 'score_model.pt')
+torch.save(model.state_dict(), "score_model.pt")

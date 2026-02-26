@@ -1,61 +1,214 @@
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
-from torch.nn import CrossEntropyLoss, L1Loss
+from torch.nn import CrossEntropyLoss
 
-def _data_collate(samples):
-	teams = [s[0] for s in samples]
-	plays = [s[1] for s in samples]
-	play_targets = [s[2] for s in samples]
-	times = [s[3] for s in samples]
-	time_targets = [s[4] for s in samples]
+from pbp_dataset import collate_fn
 
-	teams_tens = torch.stack(teams)
 
-	times_tens = pad_sequence(times)
-	time_targets_tens = pad_sequence(time_targets)
+def do_epoch(
+	model,
+	dataset,
+	batch_size,
+	optimizer,
+	device="cuda:0",
+	save_to=None,
+	writer=None,
+	start_step=0,
+):
+	loader = DataLoader(
+		dataset,
+		batch_size=batch_size,
+		collate_fn=collate_fn,
+		shuffle=True,
+		num_workers=4,
+		pin_memory=True,
+	)
 
-	plays_tens = pad_sequence(plays)
+	play_type_loss_fn = CrossEntropyLoss(reduction="mean", ignore_index=0)
+	player_loss_fn = CrossEntropyLoss(reduction="mean", ignore_index=0)
 
-	targets_tens = pad_sequence(play_targets)
+	total_play_type_loss = 0.0
+	total_player_loss = 0.0
+	total_correct = 0
+	total_count = 0
 
-	return teams_tens.long(), plays_tens.long(), targets_tens, times_tens.unsqueeze(2), time_targets_tens.unsqueeze(2)
-
-def do_epoch(model, dataset, batch_size, optimizer, save_to=None, writer=None, start_step=0):
-	loader = DataLoader(dataset, batch_size=batch_size, collate_fn=_data_collate, shuffle=True)
-
-	prog = tqdm(enumerate(loader), total=int(len(dataset) / batch_size), position=1, leave=False)
-	play_loss_fn = CrossEntropyLoss(reduction='mean', ignore_index=0)
-	time_loss_fn = L1Loss()
+	prog = tqdm(
+		enumerate(loader),
+		total=len(dataset) // batch_size,
+		position=1,
+		leave=False,
+	)
+	model.train()
 
 	steps = 0
-	for idx, (team_X, play_X, play_Y, time_X, time_Y) in prog:
-		team_X = team_X.to('cuda:0')
-		play_X = play_X.to('cuda:0')
+	for _, (teams, x_types, x_players, x_state, y_types, y_players) in prog:
+		teams = teams.to(device)
+		x_types = x_types.to(device)
+		x_players = x_players.to(device)
+		x_state = x_state.to(device)
+		y_types = y_types.to(device)
+		y_players = y_players.to(device)
 
-		Y = play_Y.to('cuda:0').transpose(0,1)
+		# Pass y_types as target_play_types so the player head is conditioned on
+		# the correct next play type during training (teacher forcing).
+		play_type_logits, player_logits, _ = model(
+			teams, x_types, x_players, x_state, target_play_types=y_types
+		)
 
-		time_Y = time_Y.to('cuda:0')
-		time_X = time_X.to('cuda:0')
+		seq, batch = y_types.shape
+		flat_y_types = y_types.view(seq * batch)
+		flat_y_players = y_players.view(seq * batch)
 
-		Y_pred_play, Y_pred_time = model(team_X, play_X, time_X)
-
-		Y_pred_play = Y_pred_play.to('cuda:0').transpose(0,2).transpose(0,1)
-		Y_pred_time = Y_pred_time.to('cuda:0')
-
-		play_loss = play_loss_fn(Y_pred_play, Y)
-		time_loss = time_loss_fn(Y_pred_time, time_Y)
-		loss = play_loss + time_loss
-
-		writer.add_scalar('loss/play', play_loss, start_step + steps)
-		writer.add_scalar('loss/time', time_loss, start_step + steps)
-		writer.add_scalar('loss/total', loss, start_step + steps)
+		play_type_loss = play_type_loss_fn(
+			play_type_logits.view(seq * batch, -1), flat_y_types
+		)
+		player_loss = player_loss_fn(
+			player_logits.view(seq * batch, -1), flat_y_players
+		)
+		loss = play_type_loss + player_loss
 
 		optimizer.zero_grad()
 		loss.backward()
+		grad_norm = torch.nn.utils.clip_grad_norm_(
+			model.parameters(), max_norm=5.0
+		)
 		optimizer.step()
+
+		mask = flat_y_types != 0
+		if mask.any():
+			preds = play_type_logits.view(seq * batch, -1).argmax(dim=1)
+			total_correct += (preds[mask] == flat_y_types[mask]).sum().item()
+			total_count += mask.sum().item()
+
+		total_play_type_loss += play_type_loss.item()
+		total_player_loss += player_loss.item()
+
+		if writer is not None:
+			writer.add_scalar(
+				"step/loss_play_type", play_type_loss.item(), start_step + steps
+			)
+			writer.add_scalar(
+				"step/loss_player", player_loss.item(), start_step + steps
+			)
+			writer.add_scalar(
+				"step/loss_total", loss.item(), start_step + steps
+			)
+			writer.add_scalar(
+				"step/perplexity_play_type",
+				play_type_loss.exp().item(),
+				start_step + steps,
+			)
+			writer.add_scalar(
+				"step/grad_norm", grad_norm.item(), start_step + steps
+			)
 
 		steps += 1
 
-	return model, [play_loss, time_loss, loss], steps
+	epoch_play_type_loss = total_play_type_loss / steps
+	epoch_player_loss = total_player_loss / steps
+	epoch_accuracy = total_correct / total_count if total_count else 0.0
+
+	losses = {
+		"play_type": epoch_play_type_loss,
+		"player": epoch_player_loss,
+		"total": epoch_play_type_loss + epoch_player_loss,
+		"play_type_accuracy": epoch_accuracy,
+	}
+
+	if writer is not None:
+		epoch = start_step // max(steps, 1)
+		writer.add_scalar("epoch/loss_play_type", epoch_play_type_loss, epoch)
+		writer.add_scalar("epoch/loss_player", epoch_player_loss, epoch)
+		writer.add_scalar(
+			"epoch/perplexity_play_type",
+			torch.tensor(epoch_play_type_loss).exp().item(),
+			epoch,
+		)
+		writer.add_scalar("epoch/play_type_accuracy", epoch_accuracy, epoch)
+
+	return model, losses, steps
+
+
+def do_validation(
+	model, dataset, batch_size, device="cuda:0", writer=None, epoch=0
+):
+	loader = DataLoader(
+		dataset,
+		batch_size=batch_size,
+		collate_fn=collate_fn,
+		num_workers=4,
+		pin_memory=True,
+		persistent_workers=True,
+	)
+
+	play_type_loss_fn = CrossEntropyLoss(reduction="mean", ignore_index=0)
+	player_loss_fn = CrossEntropyLoss(reduction="mean", ignore_index=0)
+
+	total_play_type_loss = 0.0
+	total_player_loss = 0.0
+	total_correct = 0
+	total_count = 0
+
+	model.eval()
+	with torch.no_grad():
+		for teams, x_types, x_players, x_state, y_types, y_players in tqdm(
+			loader, desc="val", position=1, leave=False
+		):
+			teams = teams.to(device)
+			x_types = x_types.to(device)
+			x_players = x_players.to(device)
+			x_state = x_state.to(device)
+			y_types = y_types.to(device)
+			y_players = y_players.to(device)
+
+			play_type_logits, player_logits, _ = model(
+				teams, x_types, x_players, x_state, target_play_types=y_types
+			)
+
+			seq, batch = y_types.shape
+			flat_y_types = y_types.view(seq * batch)
+			flat_y_players = y_players.view(seq * batch)
+
+			play_type_loss = play_type_loss_fn(
+				play_type_logits.view(seq * batch, -1), flat_y_types
+			)
+			player_loss = player_loss_fn(
+				player_logits.view(seq * batch, -1), flat_y_players
+			)
+
+			mask = flat_y_types != 0
+			if mask.any():
+				preds = play_type_logits.view(seq * batch, -1).argmax(dim=1)
+				total_correct += (
+					(preds[mask] == flat_y_types[mask]).sum().item()
+				)
+				total_count += mask.sum().item()
+
+			total_play_type_loss += play_type_loss.item()
+			total_player_loss += player_loss.item()
+
+	n = max(1, len(loader))
+	losses = {
+		"play_type": total_play_type_loss / n,
+		"player": total_player_loss / n,
+		"total": (total_play_type_loss + total_player_loss) / n,
+		"play_type_accuracy": total_correct / total_count
+		if total_count
+		else 0.0,
+	}
+
+	if writer is not None:
+		writer.add_scalar("val/loss_play_type", losses["play_type"], epoch)
+		writer.add_scalar("val/loss_player", losses["player"], epoch)
+		writer.add_scalar("val/loss_total", losses["total"], epoch)
+		writer.add_scalar(
+			"val/perplexity_play_type",
+			torch.tensor(losses["play_type"]).exp().item(),
+			epoch,
+		)
+		writer.add_scalar(
+			"val/play_type_accuracy", losses["play_type_accuracy"], epoch
+		)
+
+	return losses

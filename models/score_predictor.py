@@ -13,19 +13,20 @@ from torch.nn import (
 	GRU,
 )
 
+
 class ScorePredictor(Module):
 	def __init__(self, teams, embedding_dim=10):
 		super().__init__()
-		self.offense_embedding = Embedding(num_embeddings=len(teams), max_norm=1., embedding_dim=embedding_dim)
-		self.defense_embedding = Embedding(num_embeddings=len(teams), max_norm=1., embedding_dim=embedding_dim)
-		self.out = Linear(2*embedding_dim, 2)
+		self.offense_embedding = Embedding(
+			num_embeddings=len(teams), max_norm=1.0, embedding_dim=embedding_dim
+		)
+		self.defense_embedding = Embedding(
+			num_embeddings=len(teams), max_norm=1.0, embedding_dim=embedding_dim
+		)
+		self.out = Linear(2 * embedding_dim, 2)
 
 		self._teams = teams
-		self._teams_idx_map = {
-			t: idx
-			for idx, t
-			in enumerate(teams)
-		}
+		self._teams_idx_map = {t: idx for idx, t in enumerate(teams)}
 
 		self.double()
 
