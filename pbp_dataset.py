@@ -230,7 +230,8 @@ class PlayByPlayDataset(Dataset):
 		print("  Pre-processing games...")
 		none_idx = self.player_to_idx["<none>"]
 		self._games = []
-		self._game_labels = []  # (home, away) strings for display
+		self._game_labels = []        # (home, away) strings for display
+		self._game_player_masks = []  # per-game boolean roster masks
 		for _, game in tqdm(
 			df.groupby("game_id", sort=False), total=df["game_id"].nunique()
 		):
@@ -256,27 +257,57 @@ class PlayByPlayDataset(Dataset):
 				dtype=torch.long,
 			)
 
-			score_diff = (
-				torch.tensor(
-					game["score_diff"].fillna(0).values, dtype=torch.float32
-				)
-				/ 30.0
+			raw_score_diff = torch.tensor(
+				game["score_diff"].fillna(0).values, dtype=torch.float32
 			)
-			secs_remaining = (
-				torch.tensor(
-					game["secs_remaining"].fillna(2400).values,
-					dtype=torch.float32,
-				)
-				/ 2400.0
+			raw_secs = torch.tensor(
+				game["secs_remaining"].fillna(0).values, dtype=torch.float32
 			)
 			half = (
 				torch.tensor(game["half"].fillna(1).values, dtype=torch.float32)
 				/ 2.0
 			)
-			game_state = torch.stack([score_diff, secs_remaining, half], dim=1)
 
-			self._games.append((teams, play_types, players, game_state))
+			# Time elapsed FOR each play: secs_remaining[i-1] - secs_remaining[i].
+			# First play gets 0 (no prior play). Half transitions (where secs jump
+			# upward) produce negative diffs — clamp those to 0.
+			time_elapsed = torch.cat([
+				torch.zeros(1),
+				(raw_secs[:-1] - raw_secs[1:]).clamp(min=0),
+			]).clamp(max=120)   # cap at 2 minutes
+
+			# Score change AT each play: score_diff[i] - score_diff[i-1].
+			# First play gets 0. Clip to ±3 (max single-play change) and shift
+			# to class index 0–6 so CrossEntropyLoss can consume it directly.
+			score_delta_raw = torch.cat([
+				torch.zeros(1),
+				raw_score_diff[1:] - raw_score_diff[:-1],
+			])
+			score_delta_cls = score_delta_raw.round().long().clamp(-3, 3) + 3
+
+			# game_state input features (3,):
+			#   [score_diff/30,  log1p(time_elapsed)/log1p(30),  half/2]
+			# log1p(30) ≈ shot-clock length → most plays land near [0, 1].
+			score_diff_norm = raw_score_diff / 30.0
+			time_delta_norm = torch.log1p(time_elapsed) / torch.log1p(torch.tensor(30.0))
+			game_state = torch.stack([score_diff_norm, time_delta_norm, half], dim=1)
+
+			# Regression target in log1p-seconds space (un-normalised), used for
+			# MSE loss so the model learns absolute time scale, not relative.
+			time_delta_log = torch.log1p(time_elapsed)
+
+			self._games.append((teams, play_types, players, game_state, score_delta_cls, time_delta_log))
 			self._game_labels.append((home, away))
+
+			# Per-game roster mask: True = this player may appear in this game.
+			# Index 0 (PAD) is always False; index 1 (<none>) is always True.
+			# Used to restrict the player head to the ~20 in-game players.
+			game_player_set = set(players.tolist())
+			game_player_set.discard(0)   # PAD is never a valid prediction
+			game_player_set.add(1)       # <none> is always valid
+			mask = torch.zeros(len(self.players), dtype=torch.bool)
+			mask[list(game_player_set)] = True
+			self._game_player_masks.append(mask)
 
 		print(
 			f"  {len(self._games)} games, {len(self.teams)} teams, {len(self.players)} players"
@@ -286,7 +317,8 @@ class PlayByPlayDataset(Dataset):
 		return len(self._games)
 
 	def __getitem__(self, idx):
-		teams, play_types, players, game_state = self._games[idx]
+		teams, play_types, players, game_state, score_delta_cls, time_delta_log = self._games[idx]
+		mask = self._game_player_masks[idx]
 		return (
 			teams,
 			play_types[:-1],
@@ -294,6 +326,9 @@ class PlayByPlayDataset(Dataset):
 			game_state[:-1],
 			play_types[1:],
 			players[1:],
+			mask,
+			score_delta_cls[1:],   # score change that happens AT the next play
+			time_delta_log[1:],    # log1p(secs) elapsed for the next play
 		)
 
 
@@ -342,13 +377,16 @@ def build_dataframe(data_dir, seasons=None):
 
 def collate_fn(batch):
 	"""Pad variable-length game sequences to the longest in the batch."""
-	teams, x_types, x_players, x_state, y_types, y_players = zip(*batch)
+	teams, x_types, x_players, x_state, y_types, y_players, player_masks, y_score_delta, y_time_delta_log = zip(*batch)
 
 	return (
-		torch.stack(teams),  # (batch, 2)
-		pad_sequence(x_types),  # (seq, batch)
-		pad_sequence(x_players),  # (seq, batch)
-		pad_sequence(x_state),  # (seq, batch, 3)
-		pad_sequence(y_types),  # (seq, batch)
-		pad_sequence(y_players),  # (seq, batch)
+		torch.stack(teams),              # (batch, 2)
+		pad_sequence(x_types),           # (seq, batch)
+		pad_sequence(x_players),         # (seq, batch)
+		pad_sequence(x_state),           # (seq, batch, 3)
+		pad_sequence(y_types),           # (seq, batch)
+		pad_sequence(y_players),         # (seq, batch)
+		torch.stack(player_masks),       # (batch, n_players)
+		pad_sequence(y_score_delta),     # (seq, batch)  long, class 0-6
+		pad_sequence(y_time_delta_log),  # (seq, batch)  float, log1p seconds
 	)

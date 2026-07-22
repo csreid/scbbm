@@ -72,6 +72,13 @@ from tqdm import tqdm
 	help="Play steps per simulated game during evaluation.",
 	type=int,
 )
+@click.option(
+	"--lr",
+	default=None,
+	show_default=True,
+	help="Learning rate",
+	type=float,
+)
 def main(
 	epochs,
 	batch_size,
@@ -87,6 +94,7 @@ def main(
 	eval_every,
 	eval_games,
 	eval_steps,
+	lr
 ):
 	import os
 	import torch
@@ -136,7 +144,11 @@ def main(
 		except Exception as e:
 			tqdm.write(f"Could not load weights: {e}")
 
-	optimizer = Adam(model.parameters())
+	if lr is None:
+		# Use the default learning rate
+		optimizer = Adam(model.parameters())
+	else:
+		optimizer = Adam(model.parameters(), lr=lr)
 	writer = SummaryWriter()
 	all_steps = 0
 
@@ -180,20 +192,43 @@ def main(
 			val_set, sim_game_idx, n_steps=sim_steps, device=device
 		)
 		rows = [
-			"| # | Pred type | Pred player | True type | True player |",
-			"|---|-----------|-------------|-----------|-------------|",
+			"| # | Pred type | Pred player | Δscore | Δt(s) | True type | True player |",
+			"|---|-----------|-------------|--------|-------|-----------|-------------|",
 		]
-		for i, (pt, pp, tt, tp) in enumerate(sim, 1):
-			match = "✓" if pt == tt else " "
-			rows.append(f"| {i} | {pt} | {pp} | {tt} {match} | {tp} |")
+		for i, step in enumerate(sim, 1):
+			match = "✓" if step["pred_type"] == step["true_type"] else " "
+			rows.append(
+				f"| {i} | {step['pred_type']} | {step['pred_player']} "
+				f"| {step['pred_score_delta']:+d} | {step['pred_time_delta']} "
+				f"| {step['true_type']} {match} | {step['true_player']} |"
+			)
 		writer.add_text(f"sim/{home}_vs_{away}", "\n".join(rows), epoch)
 
-		# Team embedding projector
+		# Team embedding projector + distribution diagnostics
 		team_indices = torch.arange(len(dataset.teams), device=device)
 		team_embs = model.team_input(team_indices).detach().cpu()
 		writer.add_embedding(
 			team_embs, metadata=dataset.teams, global_step=epoch, tag="teams"
 		)
+
+		# Raw weight distribution — collapses to a spike if embeddings die
+		writer.add_histogram("embeddings/team", model.team_input.weight.detach().cpu(), epoch)
+
+		# Norm histogram: collapsed embeddings cluster at a single value
+		norms = team_embs.norm(dim=1)
+		writer.add_histogram("embeddings/team_norm", norms, epoch)
+		writer.add_scalar("embeddings/team_norm_std", norms.std().item(), epoch)
+
+		# Pairwise cosine similarity: all-ones = fully collapsed, uniform near 0 = diverse
+		normed = team_embs / norms.unsqueeze(1).clamp(min=1e-8)
+		cosim = normed @ normed.T
+		upper = cosim.triu(diagonal=1)
+		writer.add_histogram("embeddings/team_pairwise_cosim", upper[upper != 0], epoch)
+		writer.add_scalar("embeddings/team_mean_cosim", upper[upper != 0].mean().item(), epoch)
+
+		# Effective rank: sum(S/S_max). Near 1 = degenerate, near n_teams = diverse.
+		_, S, _ = torch.linalg.svd(team_embs, full_matrices=False)
+		writer.add_scalar("embeddings/team_effective_rank", (S / S[0].clamp(min=1e-8)).sum().item(), epoch)
 
 		# --- Domain-specific game quality metrics ---
 		if eval_every > 0 and (epoch + 1) % eval_every == 0:
@@ -206,7 +241,7 @@ def main(
 			metrics = compute_metrics(sim_games, ref_stats)
 			log_metrics(metrics, writer, epoch)
 			tqdm.write(
-				f"  membership={metrics['metrics/team_membership_acc']:.3f}  "
+				f"  side_acc={metrics['metrics/player_side_acc']:.3f}  "
 				f"reb_after_miss={metrics['metrics/rebound_after_miss_rate']:.3f}"
 				f"(ref={metrics['metrics_ref/rebound_after_miss']:.3f})  "
 				f"sub_pair={metrics['metrics/sub_pairing_rate']:.3f}"

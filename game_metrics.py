@@ -33,15 +33,18 @@ def build_reference_stats(dataset):
 	Compute reference statistics from the real dataset.
 
 	Returns a dict with:
-	  ref['team_rosters']:  dict mapping team_name -> set of player names
-	  ref['play_type_counts']: Counter of (play_type_str,) for freq reference
-	  ref['player_play_counts']: Counter of (player_name,) across all games
-	  ref['player_game_counts']: Counter of player_name -> appearances per game,
-	                             kept as list for std-dev calculation
+	  ref['home_players']:       dict team_name -> set of player names seen on home side
+	  ref['away_players']:       dict team_name -> set of player names seen on away side
+	  ref['player_game_counts']: dict player_name -> list of per-game play counts
 	  ref['rebound_after_miss']: float, empirical rate
 	  ref['sub_pairing']:        float, empirical rate
 	  ref['ft_adjacency']:       float, empirical rate
-	  ref['home_fg_win_rate']:   float, fraction of games home made >= away made FGs
+
+	Player side attribution uses the possession column baked into game_state.
+	Specifically: plays in the first half are split by the sign of score_diff
+	change. This is approximate; the real signal would require possession columns
+	passed through from the raw CSV. In practice the per-game roster mask already
+	guarantees membership; this is used to track *side* accuracy.
 	"""
 	# Resolve actual dataset (Subset wraps)
 	base = dataset.dataset if hasattr(dataset, "dataset") else dataset
@@ -53,10 +56,12 @@ def build_reference_stats(dataset):
 	players = base.players  # list: idx -> name
 	team_labels = base._game_labels  # list: (home, away)
 
-	team_rosters = collections.defaultdict(set)
-	player_game_counts = collections.defaultdict(
-		list
-	)  # player -> [count_game0, count_game1, ...]
+	# Map player -> which teams they appeared for as home / away
+	# player -> {team -> count_home, team -> count_away}
+	player_home_counts = collections.defaultdict(lambda: collections.Counter())
+	player_away_counts = collections.defaultdict(lambda: collections.Counter())
+
+	player_game_counts = collections.defaultdict(list)
 
 	rebound_after_miss_num = 0
 	rebound_after_miss_den = 0
@@ -64,30 +69,56 @@ def build_reference_stats(dataset):
 	sub_pairing_den = 0
 	ft_adjacency_num = 0
 	ft_adjacency_den = 0
-	home_fg_win_num = 0
-	home_fg_win_den = 0
+
+	# Plays that typically belong to the scoring team
+	_POSSESSION_PLAYS = _SHOT_TYPES | {"turnover", "offensive_rebound"}
+	# Plays that typically belong to the non-scoring/defending team
+	_DEFENSE_PLAYS = {"defensive_rebound", "steal", "block"}
 
 	for real_idx in tqdm(indices, desc="Building reference stats", leave=False):
-		teams_t, x_types, x_players, x_state, y_types, y_players = base[
+		teams_t, x_types, x_players, x_state, y_types, y_players, *_ = base[
 			real_idx
 		]
 		home, away = team_labels[real_idx]
 
-		# Reconstruct full play sequence from x+y (x is [:-1], y is [1:])
 		all_types = [play_types[t.item()] for t in x_types] + [
 			play_types[y_types[-1].item()]
 		]
 		all_players = [players[p.item()] for p in x_players] + [
 			players[y_players[-1].item()]
 		]
+		# game_state[:, 0] is score_diff (home - away) / 30
+		all_score_diff = (
+			list(x_state[:, 0].tolist()) + [x_state[-1, 0].item()]
+		)
 
-		# Team rosters (anyone who isn't <PAD> or <none>)
-		for p in all_players:
-			if p not in ("<PAD>", "<none>"):
-				team_rosters[home].add(p)
-				team_rosters[away].add(
-					p
-				)  # we can't tell sides without more data, so add to both
+		# Approximate side attribution via score_diff delta.
+		# When score_diff increases, home team scored. When it decreases, away scored.
+		for i, (t, p) in enumerate(zip(all_types, all_players)):
+			if p in ("<PAD>", "<none>"):
+				continue
+			if t in _POSSESSION_PLAYS:
+				# Scoring/turnover plays: use sign of score change at this step
+				if i + 1 < len(all_score_diff):
+					delta = all_score_diff[i + 1] - all_score_diff[i]
+				else:
+					delta = 0.0
+				if delta > 0:
+					player_home_counts[p][home] += 1
+				elif delta < 0:
+					player_away_counts[p][away] += 1
+				# delta == 0 (turnover, non-scoring): ambiguous, skip
+			elif t in _DEFENSE_PLAYS:
+				# Defensive plays belong to whichever team DIDN'T have the ball;
+				# we approximate that by flipping the scoring delta signal.
+				if i + 1 < len(all_score_diff):
+					delta = all_score_diff[i + 1] - all_score_diff[i]
+				else:
+					delta = 0.0
+				if delta > 0:
+					player_away_counts[p][away] += 1
+				elif delta < 0:
+					player_home_counts[p][home] += 1
 
 		# Per-player play counts this game
 		game_player_counts = collections.Counter(
@@ -111,27 +142,28 @@ def build_reference_stats(dataset):
 				if "sub_in" in window:
 					sub_pairing_num += 1
 
-		# FT adjacency (free throw preceded by shot/foul)
+		# FT adjacency (free throw preceded by shot/foul/other FT)
 		for i, t in enumerate(all_types):
 			if t in _FT_TYPES:
 				ft_adjacency_den += 1
 				if i > 0 and all_types[i - 1] in _FT_PRECURSORS | _FT_TYPES:
 					ft_adjacency_num += 1
 
-		# Home FG win rate (count made field goals, not free throws)
-		_FG_MADE = {"made_2pt", "made_3pt"}
-		# Without possession info we can only check aggregate FGs for the game
-		fg_count = sum(1 for t in all_types if t in _FG_MADE)
-		# Use heuristic: home teams historically win ~55% — just track as baseline
-		home_fg_win_den += 1
-		# We can't split home/away FGs from this data, so skip home_fg_win_rate
-		# and compute it from simulated games directly
+	# Build canonical home/away team sets per player (plurality vote)
+	player_home_teams = {}  # player -> set of teams they most often played home for
+	player_away_teams = {}
+	all_known_players = set(player_home_counts) | set(player_away_counts)
+	for p in all_known_players:
+		if player_home_counts[p]:
+			player_home_teams[p] = set(player_home_counts[p].keys())
+		if player_away_counts[p]:
+			player_away_teams[p] = set(player_away_counts[p].keys())
 
 	ref = {
-		"team_rosters": dict(team_rosters),
+		"player_home_teams": player_home_teams,
+		"player_away_teams": player_away_teams,
 		"player_game_counts": dict(player_game_counts),
-		"rebound_after_miss": rebound_after_miss_num
-		/ max(1, rebound_after_miss_den),
+		"rebound_after_miss": rebound_after_miss_num / max(1, rebound_after_miss_den),
 		"sub_pairing": sub_pairing_num / max(1, sub_pairing_den),
 		"ft_adjacency": ft_adjacency_num / max(1, ft_adjacency_den),
 	}
@@ -174,8 +206,8 @@ def simulate_n_games(model, dataset, n_games, n_steps=200, device="cpu"):
 			{
 				"home": home,
 				"away": away,
-				"play_types": [s[0] for s in sim],
-				"players": [s[1] for s in sim],
+				"play_types": [s["pred_type"]   for s in sim],
+				"players":    [s["pred_player"]  for s in sim],
 			}
 		)
 
@@ -191,9 +223,6 @@ def compute_metrics(simulated_games, ref, n_std=3.0):
 	if not simulated_games:
 		return {}
 
-	team_membership_hits = 0
-	team_membership_total = 0
-
 	rebound_after_miss_num = 0
 	rebound_after_miss_den = 0
 
@@ -207,6 +236,13 @@ def compute_metrics(simulated_games, ref, n_std=3.0):
 	box_outlier_den = 0
 
 	player_game_counts = ref["player_game_counts"]
+	player_home_teams = ref.get("player_home_teams", {})
+	player_away_teams = ref.get("player_away_teams", {})
+
+	# player_side_acc: among plays with a named player, fraction where the
+	# player has been seen playing for the home/away team in that capacity.
+	player_side_hits = 0
+	player_side_total = 0
 
 	for game in simulated_games:
 		home = game["home"]
@@ -214,16 +250,18 @@ def compute_metrics(simulated_games, ref, n_std=3.0):
 		pts = game["play_types"]
 		pls = game["players"]
 
-		home_roster = ref["team_rosters"].get(home, set())
-		away_roster = ref["team_rosters"].get(away, set())
-		known_players = home_roster | away_roster
-
-		# Team membership
+		# Player-side accuracy: check whether predicted player has been seen
+		# playing for home or away in that role across training games.
 		for p in pls:
-			if p not in ("<PAD>", "<none>"):
-				team_membership_total += 1
-				if p in known_players:
-					team_membership_hits += 1
+			if p in ("<PAD>", "<none>"):
+				continue
+			p_home = player_home_teams.get(p, set())
+			p_away = player_away_teams.get(p, set())
+			if not p_home and not p_away:
+				continue  # no side info available for this player
+			player_side_total += 1
+			if home in p_home or away in p_away:
+				player_side_hits += 1
 
 		# Rebound after miss
 		for i, t in enumerate(pts[:-1]):
@@ -269,16 +307,14 @@ def compute_metrics(simulated_games, ref, n_std=3.0):
 				box_outlier_num += 1
 
 	metrics = {
-		"metrics/team_membership_acc": team_membership_hits
-		/ max(1, team_membership_total),
-		"metrics/rebound_after_miss_rate": rebound_after_miss_num
-		/ max(1, rebound_after_miss_den),
+		# Post-masking, team membership is structurally guaranteed; this measures
+		# whether predicted players have been seen on the correct HOME or AWAY side.
+		"metrics/player_side_acc": player_side_hits / max(1, player_side_total),
+		"metrics/rebound_after_miss_rate": rebound_after_miss_num / max(1, rebound_after_miss_den),
 		"metrics/sub_pairing_rate": sub_pairing_num / max(1, sub_pairing_den),
-		"metrics/ft_adjacency_rate": ft_adjacency_num
-		/ max(1, ft_adjacency_den),
-		"metrics/box_score_outlier_rate": box_outlier_num
-		/ max(1, box_outlier_den),
-		# Reference baselines (logged once but useful for comparison)
+		"metrics/ft_adjacency_rate": ft_adjacency_num / max(1, ft_adjacency_den),
+		"metrics/box_score_outlier_rate": box_outlier_num / max(1, box_outlier_den),
+		# Reference baselines for quick comparison in the console log
 		"metrics_ref/rebound_after_miss": ref["rebound_after_miss"],
 		"metrics_ref/sub_pairing": ref["sub_pairing"],
 		"metrics_ref/ft_adjacency": ref["ft_adjacency"],
