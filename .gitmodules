@@ -1,3 +1,6 @@
+[submodule "data"]
+	path = ncaahoopR_data
+	url = https://github.com/lbenz730/ncaahoopR_data
 [submodule "ncaahoopR_data"]
 	path = ncaahoopR_data
-	url = https://github.com/lbenz730/ncaahoopR_data.git
+	url = https://github.com/lbenz730/ncaahoopR_data

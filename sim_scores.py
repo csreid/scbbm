@@ -1,19 +1,22 @@
 import sys
-sys.path.append('/home/csreid/.pyenv/versions/3.10.12/lib/python3.10/site-packages')
+
+sys.path.append(
+	"/home/csreid/.pyenv/versions/3.10.12/lib/python3.10/site-packages"
+)
 import torch
 from score_dataset import ScoreDataset
 from gs import GameSimulator
 import matplotlib.pyplot as plt
 
-sd = ScoreDataset('cleaned_data.csv')
+sd = ScoreDataset("cleaned_data.csv")
 gs = GameSimulator(len(sd.teams), 69)
 try:
-	gs.load_state_dict(torch.load('model.ptch'))
+	gs.load_state_dict(torch.load("model.ptch"))
 except:
-	print(f'Failed to load model')
+	print(f"Failed to load model")
 
-home = 'Purdue'
-away = 'Louisville'
+home = "Purdue"
+away = "Louisville"
 
 scores, times = gs.sim_scores(home, away, sd, length=300)
 

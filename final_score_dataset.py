@@ -4,32 +4,32 @@ import numpy as np
 import math
 from torch.utils.data import Dataset
 import sys
-sys.path.append('/home/csreid/.pyenv/versions/3.10.12/lib/python3.10/site-packages')
+
+sys.path.append(
+	"/home/csreid/.pyenv/versions/3.10.12/lib/python3.10/site-packages"
+)
+
 
 class FinalScoreDataset(Dataset):
 	def __init__(self, df_path):
-		self.df = pd.read_csv('cleaned_data.csv')
-		homes = self.df['home'].unique()
-		aways = self.df['away'].unique()
+		self.df = pd.read_csv("cleaned_data.csv")
+		homes = self.df["home"].unique()
+		aways = self.df["away"].unique()
 		self.teams = list(set(homes).union(set(aways)))
-		self._n_games = self.df['game_id'].nunique()
-		self.plays = sorted(list(self.df['description'].unique()))
+		self._n_games = self.df["game_id"].nunique()
+		self.plays = sorted(list(self.df["description"].unique()))
 
-		self.teams_id_map = dict([(val, idx) for idx, val in enumerate(sorted(self.teams))])
-		self.game_id_map = (
-			dict(
-				enumerate(
-					list(self.df['game_id'].unique())
-				)
-			)
+		self.teams_id_map = dict(
+			[(val, idx) for idx, val in enumerate(sorted(self.teams))]
 		)
+		self.game_id_map = dict(enumerate(list(self.df["game_id"].unique())))
 
 		new_rows = []
 
 	def _team_ids_to_tensor(self, team_ids):
 		tens = torch.zeros(len(self.teams))
-		tens[team_ids[0]] = 1.
-		tens[team_ids[1]] = 1.
+		tens[team_ids[0]] = 1.0
+		tens[team_ids[1]] = 1.0
 		return tens
 
 	def _teams_to_tensor(self, home, away):
@@ -49,7 +49,9 @@ class FinalScoreDataset(Dataset):
 		away = subgame.iloc[0].away
 
 		X = self._teams_to_tensor(home, away)
-		Y = torch.tensor([subgame.iloc[-1].home_score, subgame.iloc[-1].away_score])
+		Y = torch.tensor(
+			[subgame.iloc[-1].home_score, subgame.iloc[-1].away_score]
+		)
 
 		return X, Y.float()
 

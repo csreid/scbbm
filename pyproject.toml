@@ -1,21 +1,26 @@
-[tool.poetry]
+[project]
 name = "basketball"
 version = "0.1.0"
-description = ""
-authors = ["none"]
-readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jupyterlab>=4.0.5",
+    "matplotlib>=3.7.2",
+    "pandas>=2.0.3",
+    "pyarrow>=14.0.0",
+    "pypika>=0.48.9",
+    "ruff>=0.15.4",
+    "setuptools<70",
+    "tensorboard>=2.14.0",
+    "torch>=2.0.1",
+    "tqdm>=4.66.1",
+]
 
-[tool.poetry.dependencies]
-python = "^3.10"
-jupyterlab = "^4.0.5"
-pandas = "^2.0.3"
-pypika = "^0.48.9"
-matplotlib = "^3.7.2"
-torch = "^2.0.1"
-tqdm = "^4.66.1"
-tensorboard = "^2.14.0"
+[tool.uv]
+package = false
 
+[tool.ruff]
+line-length=80
 
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+[tool.ruff.format]
+indent-style="tab"
+
